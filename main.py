@@ -7,6 +7,7 @@ import logging
 import asyncio
 from config.settings import settings
 from utils.cache_manager import cache_manager
+from utils.database_manager import get_database_manager
 import re
 import pytz
 from utils.pagination import MultiEmbedPaginationView
@@ -84,6 +85,14 @@ class QianBot(commands.Bot):
             # 启动缓存后台任务
             if settings.cache.use_redis:
                 asyncio.create_task(cache_manager.start_background_tasks())
+
+            # 初始化数据库管理器
+            if settings.database.use_database_index:
+                logger.info("Initializing database manager...")
+                db_manager = get_database_manager()
+                if db_manager:
+                    await db_manager.initialize()
+
 
             # 加载扩展
             load_extension_tasks = [
