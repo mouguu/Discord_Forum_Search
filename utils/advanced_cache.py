@@ -1,4 +1,4 @@
-import redis
+import redis.asyncio as redis
 import pickle
 import logging
 import asyncio
@@ -27,6 +27,7 @@ class AdvancedCache:
         """
         self._memory_cache = {}
         self._use_redis = use_redis
+        self._redis_url = redis_url or "redis://localhost:6379/0"
         self._ttl = ttl
         self._max_items = max_items
         self._logger = logging.getLogger('discord_bot.cache')
@@ -46,28 +47,33 @@ class AdvancedCache:
         self._redis_last_check = 0
         self._redis_check_interval = 60  # 重试间隔(秒)
         
-        # Redis连接设置
-        if use_redis:
-            self._connect_to_redis(redis_url)
+        # Redis连接现在需要异步初始化，所以这里不直接连接
+        # 将在第一次使用或显式调用connect时连接
     
-    def _connect_to_redis(self, redis_url=None):
+    async def connect(self):
+        """异步初始化Redis连接"""
+        if self._use_redis:
+            await self._connect_to_redis(self._redis_url)
+
+    async def _connect_to_redis(self, redis_url=None):
         """尝试连接到Redis服务器"""
         if not self._use_redis:
             return False
             
         try:
-            self._redis = redis.from_url(redis_url or "redis://localhost:6379/0")
+            # redis.asyncio.from_url 返回一个客户端实例，不需要await
+            self._redis = redis.from_url(redis_url or self._redis_url)
             # 测试连接是否有效
-            self._redis.ping()
+            await self._redis.ping()
             self._redis_available = True
-            self._logger.info(f"Redis缓存已初始化: {redis_url}")
+            self._logger.info(f"Redis缓存已初始化: {redis_url or self._redis_url}")
             return True
         except Exception as e:
             self._redis_available = False
             self._logger.warning(f"Redis连接失败，将使用内存缓存: {e}")
             return False
     
-    def _check_redis_connection(self):
+    async def _check_redis_connection(self):
         """检查Redis连接状态，必要时尝试重连"""
         current_time = time.time()
         
@@ -79,7 +85,7 @@ class AdvancedCache:
         
         # 尝试重新连接
         self._redis_last_check = current_time
-        if self._connect_to_redis():
+        if await self._connect_to_redis():
             self._logger.info("Redis连接已恢复")
             return True
         return False
@@ -108,9 +114,9 @@ class AdvancedCache:
                     del self._memory_cache[key]
             
             # 如果启用Redis且连接可用，从Redis获取
-            if self._use_redis and (self._redis_available or self._check_redis_connection()):
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
                 try:
-                    data = self._redis.get(key)
+                    data = await self._redis.get(key)
                     if data:
                         self._stats['redis_hits'] += 1
                         self._logger.debug(f"Redis缓存命中: {key}")
@@ -149,10 +155,10 @@ class AdvancedCache:
             }
             
             # 如果启用Redis且连接可用，同时更新Redis
-            if self._use_redis and (self._redis_available or self._check_redis_connection()):
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
                 try:
                     pickled_data = pickle.dumps(data)
-                    self._redis.setex(key, self._ttl, pickled_data)
+                    await self._redis.setex(key, self._ttl, pickled_data)
                 except Exception as e:
                     self._redis_available = False
                     self._logger.error(f"Redis写入错误，仅使用内存缓存: {e}")
@@ -170,9 +176,9 @@ class AdvancedCache:
                 del self._memory_cache[key]
             
             # 如果启用Redis且连接可用，同时从Redis删除
-            if self._use_redis and (self._redis_available or self._check_redis_connection()):
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
                 try:
-                    self._redis.delete(key)
+                    await self._redis.delete(key)
                 except Exception as e:
                     self._redis_available = False
                     self._logger.error(f"Redis删除错误: {e}")
@@ -183,7 +189,7 @@ class AdvancedCache:
         """使匹配模式的所有缓存项失效. 使用 SCAN 替代 KEYS 命令.
         
         Args:
-            pattern: 匹配模式(如\'user_*\'删除所有以user_开头的键)
+            pattern: 匹配模式(如'user_*'删除所有以user_开头的键)
             
         Returns:
             删除的项数 (内存中的项数 + Redis中的项数)
@@ -201,16 +207,16 @@ class AdvancedCache:
                 mem_deleted_count += 1
             
             # Invalidate from Redis cache
-            if self._use_redis and (self._redis_available or self._check_redis_connection()):
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
                 try:
-                    # Using scan_iter as requested.
-                    # list() will consume the generator from scan_iter.
-                    # This operation, and delete below, are synchronous and will block the event loop.
-                    keys_from_redis_to_delete = list(self._redis.scan_iter(match=f"*{pattern}*"))
+                    # Using scan_iter (async iterator in redis-py asyncio)
+                    keys_from_redis_to_delete = []
+                    async for key in self._redis.scan_iter(match=f"*{pattern}*"):
+                        keys_from_redis_to_delete.append(key)
                     
                     if keys_from_redis_to_delete:
                         # self._redis.delete returns the number of keys that were removed.
-                        num_deleted_in_redis = self._redis.delete(*keys_from_redis_to_delete)
+                        num_deleted_in_redis = await self._redis.delete(*keys_from_redis_to_delete)
                         redis_deleted_count += num_deleted_in_redis
                         
                 except Exception as e:
@@ -223,7 +229,7 @@ class AdvancedCache:
                 self._stats['invalidations'] += total_deleted_count
             
             self._logger.info(
-                f"模式\'{pattern}\'缓存清理: {total_deleted_count}项 "
+                f"模式'{pattern}'缓存清理: {total_deleted_count}项 "
                 f"(内存: {mem_deleted_count}, Redis: {redis_deleted_count})"
             )
             
@@ -289,7 +295,7 @@ class AdvancedCache:
                 
                 # 定期检查Redis连接
                 if self._use_redis and not self._redis_available:
-                    if self._check_redis_connection():
+                    if await self._check_redis_connection():
                         self._logger.info("Redis连接已恢复，重新启用Redis缓存")
             except Exception as e:
                 self._logger.error(f"缓存清理错误: {e}")

@@ -1,6 +1,6 @@
 # 大型服务器性能优化指南
 
-本文档提供了针对大型Discord服务器(10,000+用户，大量帖子)的性能优化建议，帮助您的Discord机器人保持高效运行。
+本文档提供了针对大型 Discord 服务器(10,000+用户，大量帖子)的性能优化建议，帮助您的 Discord 机器人保持高效运行。
 
 ## 缓存优化
 
@@ -10,11 +10,13 @@
 
 ```python
 # 在utils目录下创建advanced_cache.py
-import redis
+import redis.asyncio as redis
 import pickle
 import logging
+import asyncio
 from typing import Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
+import time
 
 class AdvancedCache:
     """高级缓存系统，支持内存缓存和Redis"""
@@ -22,106 +24,136 @@ class AdvancedCache:
     def __init__(self, use_redis=False, redis_url=None, ttl=300, max_items=10000):
         self._memory_cache = {}
         self._use_redis = use_redis
+        self._redis_url = redis_url or "redis://localhost:6379/0"
         self._ttl = ttl
         self._max_items = max_items
         self._logger = logging.getLogger('discord_bot.cache')
+        self._redis = None
+        self._redis_available = False
+        self._redis_last_check = 0
+        self._redis_check_interval = 60
+        self._lock = asyncio.Lock()
 
-        # Redis连接设置
-        if use_redis:
-            try:
-                self._redis = redis.from_url(redis_url or "redis://localhost:6379/0")
-                self._logger.info(f"Redis缓存已初始化: {redis_url}")
-            except Exception as e:
-                self._logger.error(f"Redis连接失败，将使用内存缓存: {e}")
-                self._use_redis = False
+        # 注意：Redis连接现在应该在start或首次使用时异步初始化
+        # 这里只做配置准备
+
+    async def _connect_to_redis(self):
+        """尝试连接到Redis服务器"""
+        if not self._use_redis:
+            return False
+
+        try:
+            # redis-py asyncio 客户端创建是同步的，但操作是异步的
+            self._redis = redis.from_url(self._redis_url)
+            await self._redis.ping()
+            self._redis_available = True
+            self._logger.info(f"Redis缓存已初始化: {self._redis_url}")
+            return True
+        except Exception as e:
+            self._redis_available = False
+            self._logger.warning(f"Redis连接失败，将使用内存缓存: {e}")
+            return False
+
+    async def _check_redis_connection(self):
+        """检查并尝试恢复连接"""
+        current_time = time.time()
+        if (not self._use_redis or self._redis_available or
+            current_time - self._redis_last_check < self._redis_check_interval):
+            return self._redis_available
+
+        self._redis_last_check = current_time
+        return await self._connect_to_redis()
 
     async def get(self, key: str) -> Optional[Any]:
         """获取缓存项"""
-        current_time = datetime.now().timestamp()
+        async with self._lock:
+            current_time = datetime.now().timestamp()
 
-        # 尝试从内存缓存获取
-        if key in self._memory_cache:
-            item = self._memory_cache[key]
-            if current_time - item['timestamp'] < self._ttl:
-                self._logger.debug(f"内存缓存命中: {key}")
-                return item['data']
-            else:
-                # 过期数据清理
-                del self._memory_cache[key]
+            # 尝试从内存缓存获取
+            if key in self._memory_cache:
+                item = self._memory_cache[key]
+                if current_time - item['timestamp'] < self._ttl:
+                    self._logger.debug(f"内存缓存命中: {key}")
+                    return item['data']
+                else:
+                    del self._memory_cache[key]
 
-        # 如果启用Redis，从Redis获取
-        if self._use_redis:
-            try:
-                data = self._redis.get(key)
-                if data:
-                    self._logger.debug(f"Redis缓存命中: {key}")
-                    decoded_data = pickle.loads(data)
-                    # 同时更新内存缓存
-                    self._memory_cache[key] = {
-                        'data': decoded_data,
-                        'timestamp': current_time
-                    }
-                    return decoded_data
-            except Exception as e:
-                self._logger.error(f"Redis读取错误: {e}")
+            # 如果启用Redis，从Redis获取 (非阻塞)
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
+                try:
+                    data = await self._redis.get(key)
+                    if data:
+                        self._logger.debug(f"Redis缓存命中: {key}")
+                        decoded_data = pickle.loads(data)
+                        # 同时更新内存缓存
+                        self._memory_cache[key] = {
+                            'data': decoded_data,
+                            'timestamp': current_time
+                        }
+                        return decoded_data
+                except Exception as e:
+                    self._redis_available = False
+                    self._logger.error(f"Redis读取错误: {e}")
 
-        return None
+            return None
 
     async def set(self, key: str, data: Any) -> None:
         """设置缓存项"""
-        current_time = datetime.now().timestamp()
+        async with self._lock:
+            current_time = datetime.now().timestamp()
 
-        # 内存缓存限制
-        if len(self._memory_cache) >= self._max_items:
-            # 清理最老的20%缓存项
-            items_to_clear = int(self._max_items * 0.2)
-            sorted_items = sorted(
-                self._memory_cache.items(),
-                key=lambda x: x[1]['timestamp']
-            )
-            for old_key, _ in sorted_items[:items_to_clear]:
-                del self._memory_cache[old_key]
+            # 内存缓存限制清理
+            if len(self._memory_cache) >= self._max_items:
+                # 简单清理策略：清理20%
+                items_to_clear = max(int(self._max_items * 0.2), 1)
+                sorted_items = sorted(
+                    self._memory_cache.items(),
+                    key=lambda x: x[1]['timestamp']
+                )
+                for old_key, _ in sorted_items[:items_to_clear]:
+                    del self._memory_cache[old_key]
 
-            self._logger.info(f"缓存清理: 移除了 {items_to_clear} 项")
+            # 更新内存缓存
+            self._memory_cache[key] = {
+                'data': data,
+                'timestamp': current_time
+            }
 
-        # 更新内存缓存
-        self._memory_cache[key] = {
-            'data': data,
-            'timestamp': current_time
-        }
-
-        # 如果启用Redis，同时更新Redis
-        if self._use_redis:
-            try:
-                pickled_data = pickle.dumps(data)
-                self._redis.setex(key, self._ttl, pickled_data)
-            except Exception as e:
-                self._logger.error(f"Redis写入错误: {e}")
+            # 如果启用Redis，同时更新Redis (非阻塞)
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
+                try:
+                    pickled_data = pickle.dumps(data)
+                    await self._redis.setex(key, self._ttl, pickled_data)
+                except Exception as e:
+                    self._redis_available = False
+                    self._logger.error(f"Redis写入错误: {e}")
 
     async def invalidate(self, key: str) -> None:
         """使缓存项失效"""
-        if key in self._memory_cache:
-            del self._memory_cache[key]
+        async with self._lock:
+            if key in self._memory_cache:
+                del self._memory_cache[key]
 
-        if self._use_redis:
-            try:
-                self._redis.delete(key)
-            except Exception as e:
-                self._logger.error(f"Redis删除错误: {e}")
+            if self._use_redis and (self._redis_available or await self._check_redis_connection()):
+                try:
+                    await self._redis.delete(key)
+                except Exception as e:
+                    self._redis_available = False
+                    self._logger.error(f"Redis删除错误: {e}")
 
     async def cleanup(self) -> int:
-        """清理过期项，返回清理数量"""
-        current_time = datetime.now().timestamp()
-        expired_keys = [
-            k for k, v in self._memory_cache.items()
-            if current_time - v['timestamp'] >= self._ttl
-        ]
+        """清理过期项"""
+        async with self._lock:
+            current_time = datetime.now().timestamp()
+            expired_keys = [
+                k for k, v in self._memory_cache.items()
+                if current_time - v['timestamp'] >= self._ttl
+            ]
 
-        for key in expired_keys:
-            del self._memory_cache[key]
+            for key in expired_keys:
+                del self._memory_cache[key]
 
-        self._logger.info(f"缓存清理: 移除了 {len(expired_keys)} 个过期项")
-        return len(expired_keys)
+            return len(expired_keys)
 ```
 
 ## 数据加载和处理优化
@@ -132,7 +164,7 @@ class AdvancedCache:
 
 1. **增量加载**：不要一次加载所有消息，使用游标分页实现增量加载
 
-2. **修改搜索.py中的_search_thread方法**：
+2. **修改搜索.py 中的\_search_thread 方法**：
 
 ```python
 async def _search_thread(self, thread, search_conditions, message_limit=None):
@@ -239,7 +271,7 @@ class SearchLimiter:
 
 ### 消息内容优化
 
-Discord消息可能包含大量文本、附件和嵌入内容，这会占用大量内存。建议优化消息处理：
+Discord 消息可能包含大量文本、附件和嵌入内容，这会占用大量内存。建议优化消息处理：
 
 ```python
 def optimize_message_content(message):
@@ -621,7 +653,7 @@ def setup_logging(log_dir="logs", log_level=logging.INFO):
 ```yaml
 # 在项目根目录添加docker-compose.yml
 
-version: '3'
+version: "3"
 
 services:
   discord_bot:
@@ -649,7 +681,7 @@ volumes:
   redis_data:
 ```
 
-以及Dockerfile：
+以及 Dockerfile：
 
 ```dockerfile
 # Dockerfile
